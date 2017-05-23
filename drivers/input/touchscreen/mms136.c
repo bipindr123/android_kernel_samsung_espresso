@@ -43,6 +43,15 @@
 
 #define MELFAS_MAX_TOUCH		10
 
+#ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
+#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
+#include <linux/input/sweep2wake.h>
+#endif
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+#include <linux/input/doubletap2wake.h>
+#endif
+#endif
+
 struct ts_data {
 	u16			addr;
 	u32			flags;
@@ -254,10 +263,76 @@ ssize_t mms136_pivot_store(struct device *dev,
 
 static DEVICE_ATTR(pivot, S_IRUGO | S_IWUSR, mms136_pivot_show, mms136_pivot_store);
 
+//add dt2w stuff
+
+#ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
+static void eros_suspend(struct early_suspend *h) {
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE)
+	bool prevent_sleep = false;
+#endif
+	/*
+	 * we're taking a gamble here and assuming that the suspend/resume calls will
+	 * be correctly made by the kernel everytime screen suspend/resume is made.
+	 *
+	 * If it doesn't, well, that breaks things.
+	 *
+	 */
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE)
+	prevent_sleep = (s2w_switch > 0) && (s2w_s2sonly == 0);
+	s2w_scr_suspended = true;
+#endif
+#if defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE)
+	prevent_sleep = prevent_sleep || (dt2w_switch > 0);
+	dt2w_scr_suspended = true;
+#endif
+	if (prevent_sleep) {
+		mt_eint_unmask(CUST_EINT_TOUCH_PANEL_NUM);
+	} else {
+		nyx_suspend(h);
+	}
+}
+static void eros_resume(struct early_suspend *h) {
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE)
+	bool prevent_sleep = false;
+#endif
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE)
+	prevent_sleep = (s2w_switch > 0) && (s2w_s2sonly == 0);
+	s2w_scr_suspended = false;
+#endif
+#if defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE)
+	prevent_sleep = prevent_sleep || (dt2w_switch > 0);
+	dt2w_scr_suspended = false;
+#endif
+	if (prevent_sleep) {
+		mt_eint_mask(CUST_EINT_TOUCH_PANEL_NUM);
+		/*
+		 * now that we've masked back CUST_EINT_TOUCH_PANEL_NUM, a touch panel reset
+		 * needs to be called. However, since sprout has 5 different panels, just
+		 * call a suspend/resume cycle to allow a normal ctp reset.
+		 * Time constraints shouldn't be much given just the GPIO's are cleared,
+		 * however, maybe we should just call _resume alone since the ctp driver
+		 * should be able to handle cases where the panel is already in _resume
+		 * but waiting for an IRQ flush (?) or a GPIO reset(?).
+		 *
+		 * This is similar to ft5x06_ts's panel behaviour during _HIBERNATE mode
+		 * where the ctp doesn't respond to anything but hard reset calls.
+		 *
+		 */
+		nyx_suspend(h);
+		nyx_resume(h);
+	} else {
+		nyx_resume(h);
+	}
+}
+#endif
+
+//end stuff
+
 static struct attribute *touchscreen_attributes[] = {
 	&dev_attr_pivot.attr,
 	NULL,
 };
+
 
 static struct attribute_group touchscreen_attr_group = {
 	.attrs = touchscreen_attributes,
@@ -383,6 +458,12 @@ static void ts_late_resume(struct early_suspend *h)
 }
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
+#include <cust_eint.h>
+void (*nyx_suspend) (struct early_suspend *h);
+void (*nyx_resume) (struct early_suspend *h);
+#endif
+
 #define TS_MAX_Z_TOUCH			255
 #define TS_MAX_W_TOUCH			100
 
@@ -454,8 +535,21 @@ static int __devinit ts_probe(struct i2c_client *client,
 	ts->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
 	ts->early_suspend.suspend = ts_early_suspend;
 	ts->early_suspend.resume = ts_late_resume;
+	
+	#ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
+	if ((g_tpd_drv->suspend != NULL) && (g_tpd_drv->resume != NULL)) {
+		nyx_suspend = g_tpd_drv->suspend;
+		nyx_resume  = g_tpd_drv->resume;
+		MTK_TS_early_suspend_handler.suspend = eros_suspend;
+		MTK_TS_early_suspend_handler.resume  = eros_resume;
+	}
+#endif
+	
 	register_early_suspend(&ts->early_suspend);
 #endif
+
+
+
 	/* Check to fw. update necessity */
 	if (!fw_updater(ts, "normal")) {
 		i = 3;
